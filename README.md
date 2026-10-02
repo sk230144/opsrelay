@@ -1,30 +1,231 @@
 # OpsRelay
 
-Real-time hotel operations and incident management. React Native (Expo) + FastAPI.
+A mobile app for hotels and restaurants where staff report problems, fix them together,
+and hand work over between shifts. It keeps working even when the phone has no internet.
 
-Staff report operational problems, hand unresolved work between shifts, and coordinate
-maintenance in real time — from phones that frequently have no signal. The app is
-offline-first: every write lands in SQLite first and drains from a durable queue, so it
-behaves the same in a basement as it does on Wi-Fi.
+Built with **React Native (Expo) + TypeScript** on the phone and **FastAPI (Python)** on the server.
 
-## What is built
+---
 
-| Feature | Where |
+## 1. What is this app?
+
+Think of a hotel. A guest says "the AC in room 402 is broken". Someone has to:
+
+1. Write the problem down.
+2. Tell the right person (a technician).
+3. Track whether it is being fixed.
+4. Tell the next shift if it is still not fixed.
+
+OpsRelay does all of that on a phone. A staff member reports the problem, a supervisor
+assigns it, a technician updates the status, and a manager sees everything live.
+
+An incident moves through these steps:
+
+`Reported → Assigned → In Progress → Review → Resolved`
+
+([src/app/incident/[id].tsx](src/app/incident/[id].tsx) is the screen where this happens.)
+
+---
+
+## 2. What problem does it solve?
+
+Many hotels run on phone calls, WhatsApp and paper. That causes three problems:
+
+| Problem | What happens | How OpsRelay fixes it |
+| --- | --- | --- |
+| Issues get lost | Nobody knows who owns what | One list of incidents, each with a status and an owner |
+| Shifts don't talk to each other | The night team doesn't know what the day team left open | Shift handover with an "acknowledge" button |
+| Bad signal | Basements, kitchens and lifts have no internet, so a normal app stops working | The app works fully offline and syncs later |
+
+---
+
+## 3. How it works, in simple words
+
+### 3.1 It works without internet (the main idea)
+
+A normal app sends your change to the server straight away. If there is no internet, the
+change is lost.
+
+OpsRelay does it differently:
+
+1. When you save something, it is **first saved on the phone**.
+2. It is also put in a **waiting list** (we call it the "outbox").
+3. When the internet comes back, the app sends the waiting list to the server **one by one,
+   in order**.
+4. The screens always read from the phone's own storage, so the app looks the same online
+   or offline.
+
+You will see a banner like "3 changes waiting to sync" so you always know your work is safe.
+
+Where to look in the code:
+
+- Phone storage and the outbox table: [src/db/schema.ts](src/db/schema.ts)
+- Functions that read and write that storage: [src/db/repo.ts](src/db/repo.ts)
+- The logic that sends the waiting list: [src/lib/sync.ts](src/lib/sync.ts)
+- Noticing that the internet is back: [src/lib/connectivity.ts](src/lib/connectivity.ts)
+- The "waiting to sync" banner: [src/components/SyncBanner.tsx](src/components/SyncBanner.tsx)
+
+A new incident made offline gets a temporary id. When the server accepts it, the temporary
+id is swapped for the real one.
+
+### 3.2 It never creates the same report twice
+
+On a weak network, a message can reach the server but the reply gets lost. The app thinks it
+failed and tries again. Without protection, one report becomes three or four.
+
+The fix: every new report carries a unique **key** made on the phone. If the server sees the
+same key again, it returns the report it already saved instead of making a new one.
+
+- Key is created in [src/lib/sync.ts](src/lib/sync.ts)
+- Server checks it in [backend/app/api/incidents.py](backend/app/api/incidents.py)
+  (the key column is in [backend/app/models/__init__.py](backend/app/models/__init__.py))
+
+### 3.3 Two people edit the same incident
+
+Say you are offline and change an incident's status. Meanwhile your colleague changes the
+same incident. When you reconnect, whose change should win?
+
+OpsRelay does not guess. Each incident has a **version number** that goes up on every change.
+Your edit says "I was based on version 4". If the server is already on version 5, it says
+"conflict". The app then shows both versions side by side and you choose:
+
+- **Keep Server Version**: throw away my change.
+- **Use My Version**: send my change again on top of the new version.
+
+The conflict waits for you, but the rest of the waiting list keeps sending.
+
+- Server compares versions: [backend/app/api/incidents.py](backend/app/api/incidents.py)
+- Conflict screen: [src/app/conflicts.tsx](src/app/conflicts.tsx)
+- App detects and parks the conflict: [src/lib/sync.ts](src/lib/sync.ts)
+
+### 3.4 Scan a QR code on a room
+
+Rooms and equipment have stickers like `ROOM-402`. Scan one and the app opens that place with
+its open issues, past issues, and a "Report an issue here" button. No typing room numbers.
+
+- Camera screen: [src/app/scan.tsx](src/app/scan.tsx)
+- Location screen: [src/app/location/[code].tsx](src/app/location/[code].tsx)
+
+If you scan a correctly formatted code the system doesn't know yet (for example `ROOM-999`),
+it is registered the first time you report something there.
+
+### 3.5 Live updates
+
+When a colleague changes an incident, your screen updates by itself. No pull-to-refresh.
+This uses **Socket.IO** (a permanent connection between phone and server). The server is the
+one pushing the news.
+
+- Phone side: [src/lib/socket.ts](src/lib/socket.ts)
+- Server side: [backend/app/services/realtime.py](backend/app/services/realtime.py)
+
+The connection is checked with the user's login token, so strangers can't listen in. A live
+update will not overwrite a change you made that has not synced yet.
+
+### 3.6 Deadline timers (SLA) and automatic escalation
+
+Every incident has a time limit based on priority:
+
+| Priority | Time to fix |
 | --- | --- |
-| Role-based auth (staff / supervisor / manager), JWT + refresh, SecureStore | [src/stores/auth.ts](src/stores/auth.ts), [backend/app/api/auth.py](backend/app/api/auth.py) |
-| Offline write queue + optimistic UI | [src/lib/sync.ts](src/lib/sync.ts), [src/db/schema.ts](src/db/schema.ts) |
-| Version-conflict detection and resolution | [src/app/conflicts.tsx](src/app/conflicts.tsx), [backend/app/api/incidents.py](backend/app/api/incidents.py) |
-| Incident lifecycle `reported → assigned → in_progress → review → resolved` | [src/app/incident/[id].tsx](src/app/incident/[id].tsx) |
-| QR scanning of room/equipment codes | [src/app/scan.tsx](src/app/scan.tsx), [src/app/location/[code].tsx](src/app/location/[code].tsx) |
-| Photo capture + multipart upload | [src/app/incident/create.tsx](src/app/incident/create.tsx) |
-| Real-time updates over Socket.IO | [src/lib/socket.ts](src/lib/socket.ts), [backend/app/services/realtime.py](backend/app/services/realtime.py) |
-| SLA countdowns + automatic escalation | [src/lib/format.ts](src/lib/format.ts), [backend/app/services/notify.py](backend/app/services/notify.py) |
-| Shift handover with acknowledgement | [src/app/(tabs)/handover.tsx](src/app/(tabs)/handover.tsx) |
-| Push + local notifications | [src/lib/notifications.ts](src/lib/notifications.ts) |
+| Critical | 30 minutes |
+| High | 2 hours |
+| Medium | 8 hours |
+| Low | 24 hours |
 
-## Running it
+The phone shows a countdown. The server checks every 60 seconds, and if something is overdue
+it is **escalated** automatically (moved up so a supervisor sees it).
 
-### 1. Backend
+- Countdown on the phone: [src/lib/format.ts](src/lib/format.ts)
+- One shared timer for all cards: `useTicker` in [src/hooks/useIncidents.ts](src/hooks/useIncidents.ts)
+- Limits and escalation on the server: [backend/app/services/notify.py](backend/app/services/notify.py)
+- The 60 second check: [backend/app/main.py](backend/app/main.py)
+
+### 3.7 Shift handover
+
+At the end of a shift you pick the unresolved incidents, add notes ("Guest in 402 wants an
+update before 9 PM"), and send it. The next shift opens it and taps **Acknowledge**. Tapping it
+twice does no harm; the first person who acknowledged is kept.
+
+- Handover list: [src/app/(tabs)/handover.tsx](src/app/(tabs)/handover.tsx)
+- Create a handover: [src/app/handover/create.tsx](src/app/handover/create.tsx)
+- Server: [backend/app/api/misc.py](backend/app/api/misc.py)
+
+Creating a handover needs internet on purpose, because an old queued summary could mislead the
+next shift.
+
+### 3.8 Photos
+
+You can attach a photo to an incident (for example a photo of the broken AC).
+
+- [src/app/incident/create.tsx](src/app/incident/create.tsx)
+
+### 3.9 Roles: who can do what
+
+| Role | Can do |
+| --- | --- |
+| Staff | Report problems, comment, move an incident to review |
+| Supervisor | Everything staff can, plus assign, change priority, resolve |
+| Manager | Everything |
+
+The rules are checked **on the server** (the real protection). The phone also hides buttons
+you can't use, but that is only for convenience.
+
+- Server rules: [backend/app/api/incidents.py](backend/app/api/incidents.py)
+- Hiding buttons on the phone: [src/stores/auth.ts](src/stores/auth.ts)
+
+### 3.10 Login and security
+
+- You log in and get a short-lived **access token** and a long-lived **refresh token**.
+- Both are stored in the phone's secure storage, not in plain files.
+- When the access token expires, the app quietly gets a new one.
+- Signing out clears the local data so the next person can't see it.
+
+- Phone: [src/api/client.ts](src/api/client.ts), [src/stores/auth.ts](src/stores/auth.ts)
+- Server: [backend/app/api/auth.py](backend/app/api/auth.py), [backend/app/core/security.py](backend/app/core/security.py)
+
+### 3.11 Notifications
+
+The app can show alerts (for example "task assigned to you"). Real push notifications need a
+development build, not Expo Go. In Expo Go the app simply skips them instead of crashing.
+
+- [src/lib/notifications.ts](src/lib/notifications.ts)
+
+---
+
+## 4. How the project is organised
+
+```text
+Phone (React Native)                         Server (FastAPI)
+────────────────────                         ────────────────
+src/app/        screens                      backend/app/api/       endpoints
+src/components/ reusable pieces              backend/app/core/      config, db, login security
+src/db/         phone storage (SQLite)       backend/app/models/    database tables
+src/lib/        sync, socket, notifications  backend/app/services/  realtime, SLA, serialising
+src/hooks/      shared logic for screens     backend/app/seed.py    demo data
+src/stores/     login state
+src/api/        talks to the server
+```
+
+Flow in one picture:
+
+```text
+You tap "Save"
+   → saved in phone storage (SQLite) + added to the outbox
+   → screen updates immediately
+   → when online, outbox is sent to the server (in order)
+   → server saves it and tells other phones through Socket.IO
+```
+
+Main tools used: Expo Router (navigation), Zustand (small app state), React Hook Form + Zod
+(forms and checks), SQLite (phone storage), SQLAlchemy (server database), JWT (login).
+
+---
+
+## 5. Run it
+
+You need two terminals: backend first, then the app.
+
+### Backend
 
 ```bash
 cd backend
@@ -35,148 +236,67 @@ python -m venv .venv
 .venv/Scripts/python.exe -m uvicorn app.main:socket_app --host 0.0.0.0 --port 8000 --reload
 ```
 
-Serve `app.main:socket_app`, **not** `app.main:app` — the Socket.IO server wraps the
-FastAPI app, and serving `app` alone silently disables WebSockets.
+Use `app.main:socket_app`, **not** `app.main:app`. The second one silently turns off live
+updates.
 
-On first boot with `DEBUG=true` it creates the schema and seeds demo data. Check
-<http://localhost:8000/docs> for the API, and `/health` for a liveness probe.
+The first start creates the database and adds demo data. Check <http://localhost:8000/health>
+and <http://localhost:8000/docs>. It uses a local SQLite file by default, so you don't need to
+install Postgres.
 
-Postgres is optional — it defaults to a local SQLite file so there is nothing to install:
-
-```bash
-cd backend && docker compose up -d
-# then in .env:
-# DATABASE_URL=postgresql+psycopg://opsrelay:opsrelay@localhost:5432/opsrelay
-```
-
-### 2. Mobile app
+### Mobile app
 
 ```bash
 npm install
 npx expo start
 ```
 
-**Pointing the app at your backend.** `localhost` on a phone means the phone itself.
-The client rewrites `localhost` to `10.0.2.2` automatically for the Android emulator, but
-for a **physical device** set your machine's LAN IP in two places:
+Press `a` for an Android emulator, or scan the QR code with Expo Go.
+
+On a **real phone**, `localhost` means the phone itself. Put your computer's IP address in:
 
 - `app.json` → `expo.extra.apiUrl` → `http://192.168.x.x:8000`
-- `backend/.env` → `PUBLIC_BASE_URL=http://192.168.x.x:8000` (so photo URLs resolve)
+- `backend/.env` → `PUBLIC_BASE_URL=http://192.168.x.x:8000` (so photos load)
 
 ### Demo accounts
 
-Password for all three: `opsrelay123`
+Password for all: `opsrelay123`
 
-| Role | Email | Can |
-| --- | --- | --- |
-| Manager | `maya@opsrelay.dev` | everything |
-| Supervisor | `sam@opsrelay.dev` | assign, reprioritise, resolve |
-| Staff | `raj@opsrelay.dev` | report, comment, advance to review |
+| Role | Email |
+| --- | --- |
+| Manager | `maya@opsrelay.dev` |
+| Supervisor | `sam@opsrelay.dev` |
+| Staff | `raj@opsrelay.dev` |
 
-## Demonstrating the offline queue
+QR codes to try (make them with any QR generator):
+`ROOM-402`, `ROOM-311`, `ROOM-208`, `AREA-LOBBY`, `AREA-KITCHEN`, `EQUIP-FREEZER-1`, `EQUIP-LIFT-2`
 
-This is the part worth showing live:
+---
 
-1. Sign in and let the dashboard load.
-2. Turn off Wi-Fi / enable airplane mode. A purple **Offline** banner appears.
-3. Report two or three incidents. Each saves instantly and is tagged `NOT YET SYNCED`.
-4. Change a status. The card shows `EDIT QUEUED`.
-5. The banner reads **"3 changes waiting to sync"**.
-6. Turn the network back on. The queue drains by itself, temporary ids are replaced with
-   server ids, and the badges clear.
+## 6. Try the offline feature
 
-### Demonstrating conflict resolution
+1. Log in and let the dashboard load.
+2. Turn on airplane mode. A purple **Offline** banner appears.
+3. Report two or three incidents. Each is saved instantly with a "not yet synced" tag.
+4. The banner says "3 changes waiting to sync".
+5. Turn the internet back on. The list sends by itself and the tags disappear.
 
-1. Offline, change an incident's status on the device.
-2. While still offline, change the *same* incident from another client:
-   ```bash
-   curl -X PATCH http://localhost:8000/api/incidents/<id> \
-     -H "Authorization: Bearer <token>" -H "Content-Type: application/json" \
-     -d '{"status":"in_progress","base_version":1}'
-   ```
-3. Bring the device back online. The queued edit is now based on a stale version, the
-   server answers `409`, and the app shows both versions side by side with
-   **Keep Server Version** / **Use My Version**.
+**To see a conflict:** change an incident while offline, then change the same incident from
+another place (for example with `curl` against the API), then reconnect. The conflict screen
+appears.
 
-### QR codes
+---
 
-Seeded location codes — generate QR images for these at any QR generator:
+## 7. Honest limits
 
-`ROOM-402` · `ROOM-311` · `ROOM-208` · `AREA-LOBBY` · `AREA-KITCHEN` ·
-`EQUIP-FREEZER-1` · `EQUIP-LIFT-2`
+- Real push notifications need a development build (not Expo Go).
+- Photos are saved on the server's disk. A real product should use cloud storage like S3.
+- There are no automated tests yet. Things were checked by running the app and calling the
+  endpoints directly.
+- Sync downloads everything each time instead of only what changed.
+- An edit made to an incident that was created offline can show up as a false conflict after
+  that incident syncs.
+- The deadline check runs inside the web server. A real deployment would use a separate job
+  runner.
+- Camera and push need a physical phone.
 
-Scanning a code opens that location with its open issues and history. A well-formed but
-unregistered code (e.g. `ROOM-999`) registers itself on first report rather than being
-discarded.
-
-## Architecture notes
-
-**Why writes never go straight to the network.** Every mutation is written to SQLite and
-appended to an `outbox` table, then drained in FIFO order. The UI reads only from SQLite,
-so there is one render path regardless of connectivity. Ordering matters: a comment on an
-incident that is itself still queued must not be sent first, so a create that has not yet
-earned a server id blocks ops that depend on it rather than failing them.
-
-**Creates are idempotent.** A queued create carries a `client_key` (the local temp id,
-persisted with the op and stable across retries). If a POST reaches the server but the
-response is lost — a flaky-network hallmark — the retry returns the original incident
-rather than filing a second one. A unique index on `client_key` plus an `IntegrityError`
-catch covers the case where two retries race past the lookup. Without this, one report
-filed on a weak connection became three or four rows, and the stale local copy kept its
-*"only on this device"* badge forever because the op never cleared the queue.
-
-**Conflict detection.** Every incident carries a monotonic `version`. A `PATCH` sends the
-`base_version` it was built on; if the stored version has moved past it the server returns
-`409` with its current values. The client parks that op and keeps draining the rest — a
-conflict needs a human but must not block unrelated work. Neither side is auto-merged,
-because either choice can discard real work.
-
-**All SQLite writes are serialized.** `expo-sqlite`'s `withTransactionAsync` is
-explicitly non-exclusive — the docs warn it "can be interrupted by other async
-queries". With several independent writers on one connection (the sync drain, a
-`pullAll` refreshing four tables, optimistic UI writes), their `BEGIN`/`COMMIT` pairs
-interleave and one path rolls back a transaction another already committed, crashing with
-*"cannot rollback - no transaction is active"*. Every write therefore goes through
-`withWriteLock` in [src/db/schema.ts](src/db/schema.ts) via the `transact` helper in
-[src/db/repo.ts](src/db/repo.ts). `withExclusiveTransactionAsync` was the alternative, but
-it trades this crash for `database is locked` on the losing writer and is unavailable on
-web. `pullAll` additionally shares one in-flight promise so launch cannot start two pulls.
-
-**Timestamps.** SQLite does not preserve `tzinfo`, so datetimes are tagged UTC at
-serialization ([backend/app/services/serialize.py](backend/app/services/serialize.py)).
-Without this, `new Date(...)` on the client parses them as local time and every SLA
-countdown is wrong by the device's UTC offset.
-
-**SLA escalation** runs as an asyncio sweep every 60s in the app lifespan. A production
-deployment would move this to Celery or an external scheduler rather than coupling it to
-a web process.
-
-## Verified
-
-- `npx tsc --noEmit` — clean
-- `npx expo lint` — 0 errors
-- `npx expo export` — bundles for both iOS and Android
-- Backend: login, token-type enforcement (a refresh token is rejected as an access token),
-  refresh rotation, role gates (403), illegal status transitions (422), row-level scoping
-  for staff, 409 conflict payloads, SLA auto-escalation, idempotent handover
-  acknowledgement, and authenticated Socket.IO broadcast.
-
-## Known limitations
-
-- **Notifications need a development build on Android.** Expo Go dropped Android remote
-  push in SDK 53, and `expo-notifications` throws *on import* there — not just on use. So
-  [src/lib/notifications.ts](src/lib/notifications.ts) loads the module lazily inside
-  try/catch and every export degrades to a no-op; a static import would crash the root
-  layout and take the whole route tree with it. Profile → Notifications shows the current
-  state. Run `eas build --profile development` for real push (`getExpoPushTokenAsync`
-  also needs an EAS `projectId`). Everything else works normally in Expo Go.
-- **Attachments are served from local disk** via `/uploads`. Swap for S3 or Supabase
-  Storage before any real deployment.
-- **CORS is wide open** because the mobile client is not a browser origin. Restrict it if
-  a web dashboard is added.
-- **No automated test suite.** The backend was verified by exercising the endpoints
-  directly; the flows above are the reproduction steps.
-- `npm audit` reports advisories in Expo's own build tooling (`@expo/config`,
-  `prebuild-config`). They are build-time only, and `audit fix --force` downgrades Expo
-  itself, so they are left as-is.
-- Camera and push need a physical device; the simulator cannot scan or receive push.
+For a deeper, interview-style explanation, see [INTERVIEW.md](INTERVIEW.md).
